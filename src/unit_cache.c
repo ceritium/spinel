@@ -42,6 +42,7 @@
 #include "csplit.h"
 #include "sha256.h"
 #include "timing.h"
+#include "console.h"
 
 /* Copy a file; the number of bytes written, or -1. A caller that needs
    the whole file compares the count with the source's size: a short copy
@@ -603,6 +604,11 @@ static int inc_build(IncBuild *b, const char *cmd, size_t src_end, const char *c
   } else {
     const char *w = NULL;
     int rc = inc_presplit(b->flags, c_path, b->work, o, &b->res, &w);
+    if (rc == 0 && g_console_host_dir && console_host_prepare(b->work, &b->res) != 0) {
+      c_split_result_free(&b->res);
+      rc = -1;
+      w = "cannot prepare the console host's units";
+    }
     if (rc != 0) snprintf(why, sizeof why, "%s", w);
     else {
       int n = b->res.n > 0 ? b->res.n : 1;

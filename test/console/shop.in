@@ -1,0 +1,36 @@
+it = $items[0]; nil
+it.name
+it.price * 2
+$items.map { |i| i.name }.join(", ")
+n = $items.size
+n + 1
+def double(x)
+  x * 2
+end
+double(n)
+class Item
+  def label
+    "#{@name}: #{@price}"
+  end
+end
+$items[1].label
+class Basket
+  def initialize
+    @items = []
+  end
+  def add(i)
+    @items << i
+    self
+  end
+  def count = @items.size
+end
+Basket.new.add(it).add($items[1]).count
+:spinel_console
+nil.upcase
+n = "many"
+:restart
+n
+double(n)
+LIMIT = 10
+:restart
+LIMIT + n.size

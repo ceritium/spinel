@@ -1,7 +1,7 @@
 # Interactive Spinel: design sketch
 
-Status: idea, nothing built. This branch of a fork holds the design so it
-can be discussed before any code.
+Status: option 3 is built (`spinel console`, see its section below).
+Options 1 and 2 are not.
 
 ## The problem
 
@@ -94,11 +94,36 @@ as long as they don't change a type the program already fixed. A line
 that widens one (an Integer slot now holding nil) is refused with the slot
 named, or the session restarts with the line folded into the program.
 
-This needs the frontend to load a previous run's decisions instead of
-inferring everything again, and codegen to emit a unit that links against
-the symbols of a binary already built. Close to Cling's model for C++.
-It is a large change, and option 2 shows first how much of a console the
-ext layer can carry.
+Status: implemented as `spinel console [FILE.rb] [-I DIR]`
+(`src/console.c`), without loading a previous run's decisions. Every line
+recompiles the whole session, and a diff of the generated C decides what
+the line changed:
+
+- **The session** is one Ruby program: FILE.rb, the definitions every
+  line brought, and a method `__spl_l<N>` per line. A console local is the
+  global `$__spl_<name>`, so it outlives its line.
+- **The host** is the first build (`--console-host DIR`): the program's top
+  level runs, then `sp_console_loop` (`lib/console/`) waits for shared
+  objects to `dlopen`. Each program function `f` is built as a body
+  `f__spl0`, a pointer `f__spl_ptr` and an `f` that calls through it.
+  Code and tables keep naming `f`; a line repoints the pointer.
+- **A line** compiles the session again (`-c --incremental`) and compares
+  each top-level C definition with what the process holds. What is new is
+  loaded. A function whose body changed under the same signature is loaded
+  as `f__spl<N>` and installed by a constructor. A constant table that
+  changed (the class and symbol registries a new class or symbol grows) is
+  loaded under a new name, with every function that reads it.
+  `--console-symbols` keeps symbol ids stable across builds, and ids made
+  at run time start at 2^24, above any id a later line adds.
+- **A refusal** is any other change: a struct layout, a signature (a
+  method or a local now taking another type), a non-constant global, or a
+  line whose definitions run at load (a constant, a `require`). The
+  refusal names the slot. `:restart` folds the line into the program,
+  rebuilds the host and replays the session with its output hidden.
+
+`make console-test` runs the transcripts in `test/console/`. Known costs:
+each line takes about 0.15 s to compile, and on macOS the first `dlopen`
+of a new file takes about 0.3 s, spent outside the process.
 
 ## Proposal
 

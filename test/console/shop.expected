@@ -1,0 +1,31 @@
+stocked 2
+=> nil
+=> "pen"
+=> 6
+=> "pen, book"
+=> 2
+=> 3
+=> :double
+=> 4
+=> nil
+=> "book: 12"
+=> nil
+=> 2
+=> :spinel_console
+NoMethodError: undefined method 'upcase' for nil
+refused: this line changes code the running program already holds:
+  local variable `n` (a value of another type)
+  double
+:restart folds the line into the program and replays the session
+restarting: the program's top level and 15 lines run again
+stocked 2
+=> "many"
+=> "many"
+=> "manymany"
+refused: this line changes code the running program already holds:
+  the program's top level (a line whose code runs at load, such as a constant)
+:restart folds the line into the program and replays the session
+restarting: the program's top level and 18 lines run again
+stocked 2
+=> 10
+=> 14
