@@ -6077,11 +6077,13 @@ static int param_handed_computed_name(Compiler *c, int arg, const char *vn, int 
   if (key >= 0 && c->send_param_memo && c->send_param_memo[key]) return c->send_param_memo[key] == 2;
   int res = 0;
   /* the calls of the method's name, off the calls-by-name index: every
-     call of the program was read for each parameter asked about */
-  for (int id = an_calls_named_first(c, sc->name); id >= 0 && !res; id = an_calls_named_next(id)) {
+     call of the program was read for each parameter asked about. An
+     initialize is handed its arguments by `new`. */
+  const char *callee = sp_streq(sc->name, "initialize") ? "new" : sc->name;
+  for (int id = an_calls_named_first(c, callee); id >= 0 && !res; id = an_calls_named_next(id)) {
     if (nt_kind(nt, id) != NK_CallNode) continue;
     const char *cn = nt_str(nt, id, "name");
-    if (!cn || !sp_streq(cn, sc->name)) continue;
+    if (!cn || !sp_streq(cn, callee)) continue;
     int a = nt_ref(nt, id, "arguments");
     int an = 0;
     const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
@@ -6097,11 +6099,42 @@ static int param_handed_computed_name(Compiler *c, int arg, const char *vn, int 
   return res;
 }
 
+static int class_is_ancestor(Compiler *c, int sup, int cls) {
+  for (int k = cls, hops = 0; k >= 0 && k < c->nclasses && hops < c->nclasses; k = c->classes[k].parent, hops++)
+    if (k == sup) return 1;
+  return 0;
+}
+/* -1 is an owner outside any class (a class method's ivar): related to all */
+static int ivar_owner_related(Compiler *c, int owner, int other) {
+  return owner < 0 || other < 0 || class_is_ancestor(c, owner, other) || class_is_ancestor(c, other, owner);
+}
+
+/* An ivar is a computed name when a write of it in the same class hierarchy
+   stores one (`@name = name` in initialize, with `new` handed a computed
+   name), as a local is. */
+static int ivar_holds_computed_name(Compiler *c, int arg, int depth) {
+  const NodeTable *nt = c->nt;
+  const char *vn = nt_str(nt, arg, "name");
+  if (!vn || depth > 4) return 0;
+  int owner = comp_ivar_owner(c, arg);
+  NT_FOREACH_KIND(nt, NK_InstanceVariableWriteNode, w) {
+    const char *wn = nt_str(nt, w, "name");
+    if (!wn || !sp_streq(wn, vn) || !ivar_owner_related(c, owner, comp_ivar_owner(c, w))) continue;
+    int wv = nt_ref(nt, w, "value");
+    if (value_is_computed_name(c, wv)) return 1;
+    NodeKind vk = nt_kind(nt, wv);
+    if ((vk == NK_LocalVariableReadNode || vk == NK_InstanceVariableReadNode) &&
+        send_name_is_computed(c, wv, depth + 1)) return 1;
+  }
+  return 0;
+}
+
 static int send_name_is_computed(Compiler *c, int arg, int depth) {
   const NodeTable *nt = c->nt;
   if (node_is_container_read(nt, arg)) return container_read_holds_computed(c, arg);
   if (node_is_computed_name(nt, arg)) return 1;
   NodeKind ak = nt_kind(nt, arg);
+  if (ak == NK_InstanceVariableReadNode) return ivar_holds_computed_name(c, arg, depth);
   if (ak != NK_LocalVariableReadNode) return 0;
   const char *vn = nt_str(nt, arg, "name");
   int scope = (arg >= 0 && arg < nt->count) ? c->nscope[arg] : -1;
@@ -6118,8 +6151,8 @@ static int send_name_is_computed(Compiler *c, int arg, int depth) {
     if (value_is_computed_name(c, wv)) return 1;
     /* and one bound to another local (`t = s`, as `&s` binds the Symbol it
        is passed) is that local */
-    if (nt_kind(nt, wv) == NK_LocalVariableReadNode && depth < 4 &&
-        send_name_is_computed(c, wv, depth + 1)) return 1;
+    if ((nt_kind(nt, wv) == NK_LocalVariableReadNode || nt_kind(nt, wv) == NK_InstanceVariableReadNode) &&
+        depth < 4 && send_name_is_computed(c, wv, depth + 1)) return 1;
   }
   /* a parameter no statement of the method rebinds: the names its callers hand it */
   if (!written) return param_handed_computed_name(c, arg, vn, depth);

@@ -231,7 +231,8 @@ names alone on a boxed receiver, so a builtin's method raises `NoMethodError`
 there. A method's parameter is a computed name when a caller hands it one
 (`handle(name) = public_send(name)` called with `"on_#{ev}".to_sym`), also
 through a method that passes the parameter on; handed only literals, it keeps
-the literal arms. An element of a table filled with such names is computed too
+the literal arms. So is an instance variable a write in its class hierarchy
+stores one into (`@name = name` in `initialize`, `new` handed a computed name). An element of a table filled with such names is computed too
 (`M = Hash.new { |h, t| h[t] = :"on_#{t}" }` then `send(M[t])`, or a table a
 `[]=` stores them into). A **literal** name is fully resolved -- see below.
 `public_send(*args, &blk)` with the name as the first element of a splatted
