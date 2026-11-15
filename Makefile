@@ -343,6 +343,12 @@ SPINEL_OBJ  += build/csrc/sha256.o
 # --incremental's native step: preprocess, split into units, build.
 SPINEL_HDRS += src/unit_cache.h
 SPINEL_OBJ  += build/csrc/unit_cache.o
+# `spinel console`: lines compiled against a running program (reads a line
+# with prism, so its object sees prism's headers).
+SPINEL_HDRS += src/console.h
+SPINEL_OBJ  += build/csrc/console.o
+build/csrc/console.o build/csrc-work/console.o build/csrc-trace/console.o build/csrc-san/console.o: CFLAGS += -I$(PRISM_INC)
+build/csrc/console.o build/csrc-work/console.o build/csrc-trace/console.o build/csrc-san/console.o: $(PRISM_LIB)
 
 build/csrc:
 	@mkdir -p build/csrc
@@ -1900,6 +1906,13 @@ defer-refusals-test: $(SPINEL)
 	done; \
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "defer-refusals-test: pass"; else exit 1; fi
+
+.PHONY: console-test
+# `spinel console`: sessions typed from test/console/*.in against their
+# transcripts (tools/console_check.sh). Not in test-run: each line is a
+# compile and a dlopen, so a session takes seconds.
+console-test: $(SPINEL) $(SP_RT_LIB)
+	@tools/console_check.sh $(SPINEL)
 
 .PHONY: analysis-forms-test
 # One of test-run's legs, named here beside its recipe.
@@ -6563,6 +6576,8 @@ install: all bin/spin
 	for h in lib/*.h; do install -m 644 $$h $(SPNLDIR)/lib/; done
 	install -d $(SPNLDIR)/lib/spinel
 	install -m 644 lib/spinel/runtime.h  $(SPNLDIR)/lib/spinel/
+	install -d $(SPNLDIR)/lib/console
+	install -m 644 lib/console/sp_console_host.c $(SPNLDIR)/lib/console/
 	@# The wasm32-wasi shim headers go with the runtime headers; the target's
 	@# archives go too when `make wasm-rt` built them -- the --exceptions=abort
 	@# one beside the default, since main.c links it for that flag (packages'

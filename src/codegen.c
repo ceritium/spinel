@@ -758,6 +758,9 @@ int class_has_subclass(Compiler *c, int ocid) {
 }
 
 const char *g_ext_init_name = NULL;
+/* --console-symbols FILE (`spinel console`): the Symbols of the build the
+   running process holds keep their ids, and the new ones follow them */
+const char *g_console_symbols = NULL;
 const char *g_ext_entries = NULL;
 const char *g_ext_classes = NULL;      /* --ext-class: classes whose instance methods the library exports by name */
 const char *g_ext_target = NULL;       /* --ext cruby: generate the host shim */
@@ -22723,10 +22726,42 @@ static uint32_t sym_hash_n(const char *s, size_t n) {
   "for(size_t i=0;i<n;i++){h^=(unsigned char)s[i];h*=16777619u;}" \
   "h^=h>>16;h*=0x7feb352du;h^=h>>15;return h;}\n"
 
+/* --console-symbols: one Symbol per line, its bytes in hex. A Symbol made at
+   run time takes an id from SP_CONSOLE_DYN_BASE on, above any a later line
+   adds to the table, so a value the process holds keeps its name. */
+#define SP_CONSOLE_DYN_BASE (1 << 24)
+static void console_symbols_seed(Compiler *c) {
+  FILE *f = fopen(g_console_symbols, "r");
+  if (!f) return;
+  char line[8192];
+  while (fgets(line, sizeof line, f)) {
+    size_t n = strcspn(line, "\r\n") / 2;
+    char *name = malloc(n + 1);
+    for (size_t i = 0; i < n; i++) { unsigned v = 0; sscanf(line + 2 * i, "%2x", &v); name[i] = (char)v; }
+    name[n] = 0;
+    comp_sym_intern_n(c, name, n);
+    free(name);
+  }
+  fclose(f);
+}
+static void console_symbols_write(const Compiler *c) {
+  FILE *f = fopen(g_console_symbols, "w");
+  if (!f) { fprintf(stderr, "spinel: cannot write %s\n", g_console_symbols); exit(1); }
+  for (int i = 0; i < c->nsymbols; i++) {
+    size_t sl = c->symbol_lens ? c->symbol_lens[i] : strlen(c->symbols[i]);
+    for (size_t k = 0; k < sl; k++) fprintf(f, "%02x", (unsigned char)c->symbols[i][k]);
+    fputc('\n', f);
+  }
+  fclose(f);
+}
+
 /* The symbol table runtime (under g_emit_sym_rt) and sp_class_to_s, the class names the poly render arms print (under g_emit_class_names) (codegen_program's steps, in their order) */
 static void emit_sym_class_name_rt(Compiler *c, Buf *b) {
   if (g_emit_sym_rt) {
     int ns = c->nsymbols;
+    /* the first id of a Symbol made at run time */
+    int db = g_console_symbols ? SP_CONSOLE_DYN_BASE : ns;
+    if (g_console_symbols) console_symbols_write(c);
     if (ns > 0) {
       /* A name holding a NUL cannot use either inline literal form: both are
          GNU statement expressions, and this is a STATIC initializer, which
@@ -22882,13 +22917,13 @@ static void emit_sym_class_name_rt(Compiler *c, Buf *b) {
                      "int _k=SP_ATOMIC_LOAD(&sp_ndyn,__ATOMIC_ACQUIRE);const char **_p=SP_ATOMIC_LOAD(&sp_dyn_syms,__ATOMIC_ACQUIRE);"
                      "if(id>=%d&&id<%d+_k)return _p[id-%d];"
                      "return sp_str_empty;}\n",
-                     ns, ns > 0 ? "sp_sym_names[id]" : "sp_str_empty", ns, ns, ns);
+                     ns, ns > 0 ? "sp_sym_names[id]" : "sp_str_empty", db, db, db);
     else
       buf_printf(b, "const char *sp_sym_to_s(sp_sym id){"
                      "if(id>=0&&id<%d)return %s;"
                      "if(id>=%d&&id<%d+sp_ndyn)return sp_dyn_syms[id-%d];"
                      "return sp_str_empty;}\n",
-                     ns, ns > 0 ? "sp_sym_names[id]" : "sp_str_empty", ns, ns, ns);
+                     ns, ns > 0 ? "sp_sym_names[id]" : "sp_str_empty", db, db, db);
     /* Byte-exact interning: a name may hold a NUL, which strcmp cannot see
        past. The stored entries carry their length (a 0xf1 struct entry in its
        header, a 0xff literal through strlen, a dyn entry through its heap
@@ -22921,7 +22956,7 @@ static void emit_sym_class_name_rt(Compiler *c, Buf *b) {
                      "if((uint32_t)sp_ndyn+1u>((uint32_t)sp_dsym_ix[0]+1u)/2u)sp_dsym_ix_grow();"
                      "int _id=sp_ndyn;sp_dyn_syms[_id]=_e;SP_ATOMIC_STORE(&sp_ndyn,_id+1,__ATOMIC_RELEASE);"
                      "sp_dsym_ix_put(_id,h);"
-                     "SP_DYN_SYMS_UNLOCK();return (sp_sym)(%d+_id);}\n", ns, ns);
+                     "SP_DYN_SYMS_UNLOCK();return (sp_sym)(%d+_id);}\n", db, db);
     buf_printf(b, "%s", g_ext_init_name ? "" : "static ");
     buf_puts(b, "sp_sym sp_sym_intern_n(const char *s, size_t n){uint32_t h=sp_sym_hash_n(s,n);");
     if (ns > 0)
@@ -22929,14 +22964,14 @@ static void emit_sym_class_name_rt(Compiler *c, Buf *b) {
                   "while((e=sp_sym_htab[i])!=0){if((uint32_t)(e>>32)==h){int id=(int)(uint32_t)e-1;const char*_c=sp_sym_names[id];"
                   "if(sp_str_byte_len(_c)==n&&memcmp(_c,s,n)==0)return (sp_sym)id;}"
                   "i=(i+1)&SP_SYM_HMASK;}}");
-    buf_printf(b, "int _f=sp_dsym_find(s,n,h);if(_f>=0)return (sp_sym)(%d+_f);", ns);
+    buf_printf(b, "int _f=sp_dsym_find(s,n,h);if(_f>=0)return (sp_sym)(%d+_f);", db);
     if (mt)
       buf_puts(b, "return sp_dyn_syms_add(s,n,h);}\n");
     else
       buf_printf(b, "if(sp_ndyn>=sp_dyn_cap)sp_dyn_syms_grow();"
                     "if((uint32_t)sp_ndyn+1u>((uint32_t)sp_dsym_ix[0]+1u)/2u)sp_dsym_ix_grow();"
                     "char *_d=sp_str_alloc_nogc(n);if(n)memcpy(_d,s,n);"
-                    "int _id=sp_ndyn++;sp_dyn_syms[_id]=_d;sp_dsym_ix_put(_id,h);return (sp_sym)(%d+_id);}\n", ns);
+                    "int _id=sp_ndyn++;sp_dyn_syms[_id]=_d;sp_dsym_ix_put(_id,h);return (sp_sym)(%d+_id);}\n", db);
     buf_printf(b, "%ssp_sym sp_sym_intern(const char *s){return sp_sym_intern_n(s,s?strlen(s):0);}\n\n",
                g_ext_init_name ? "" : "static ");
   }
@@ -23885,6 +23920,7 @@ char *codegen_program(const NodeTable *nt) {
   char *isa_ext = NULL;  /* sp_poly_is_a's class-value arms, and where they go */
   size_t isa_ext_at = 0;
   Compiler *c = comp_new(nt);
+  if (g_console_symbols) console_symbols_seed(c);
   plain_note_parsed(c);   /* ahead of the analysis's desugars */
   analyze_program(c);
   double tcg = sp_timing_now();

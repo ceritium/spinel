@@ -31,6 +31,7 @@
 #include "decide.h"
 #include "method_table_check.h"
 #include "order_plan.h"
+#include "console.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -492,7 +493,8 @@ static void usage(void) {
     "       spinel app.rb -S           - print C to stdout\n"
     "       spinel app.rb --print-build - print the build ingredients, compile nothing\n"
     "       spinel -e 'puts 42'        - compile inline source\n"
-    "       spinel -E app.rb a b c     - compile + run with ARGV=[a, b, c]\n\n"
+    "       spinel -E app.rb a b c     - compile + run with ARGV=[a, b, c]\n"
+    "       spinel console [app.rb]    - run app.rb, then type lines into it\n\n"
     "Options:\n"
     "  -o FILE     Output file\n"
     "  --link ARG  Extra link input (object/archive/-lLIB); repeatable\n"
@@ -865,7 +867,8 @@ static int cc_native_build(const char *cmd, size_t src_at, size_t src_end, const
   if (inc_flags.on) {
     IncrementalOpts o = { inc_flags.unit_bytes, inc_flags.cache_stats, want_g, cc_cmd, NULL };
     cc_rc = cc_incremental_build(cmd, src_at, src_end, c_path, cc_jobs, &o);
-    if (cc_rc != 0 && !getenv("SPINEL_INCREMENTAL_STRICT")) cc_rc = system(cmd);
+    /* a console host is the unit set or nothing: console.c reads the set back */
+    if (cc_rc != 0 && !getenv("SPINEL_INCREMENTAL_STRICT") && !g_console_host_dir) cc_rc = system(cmd);
     return cc_rc;
   }
   /* Unasked, only a large unit is split: a part cannot inline what another
@@ -943,8 +946,21 @@ int main(int argc, char **argv) {
     fprintf(stderr, "spinel: cannot run %s (build it with `make tools`)\n", tool);
     return 4;
   }
+  /* `spinel console FILE.rb`: lines compiled against the running program
+     (console.c) */
+  if (argc >= 2 && sp_streq(argv[1], "console")) {
+    char dir[4096];
+    exe_dir(argv[0], dir, sizeof dir);
+    char self[4200], lib_dir[4096];
+    snprintf(self, sizeof self, "%s/spinel", dir);
+    resolve_lib_dir(argv[0], lib_dir, sizeof lib_dir);
+    return console_main(argc - 2, argv + 2, self, lib_dir);
+  }
   const char *source = NULL;
   const char *output = NULL;
+  /* --console-host: a binary that dlopens code compiled after it (console.c)
+     keeps every runtime and program symbol, and exports them */
+  int console_host = 0;
   /* Every --link consumes an argv slot, so argc bounds the list. A fixed
      array dropped the entries past its end without a word: a program whose
      packages carry more than 64 objects linked without the last of them
@@ -1021,6 +1037,8 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "--no-bigint"))   { no_bigint = 1; i++; }
     else if (sp_streq(a, "--int-overflow")) { if (++i < argc) int_overflow = argv[i]; i++; }
     else if (sp_streq(a, "-o"))            { if (++i < argc) output = argv[i]; i++; }
+    else if (sp_streq(a, "--console-host")) { console_host = 1; inc_flags.on = 1; if (++i < argc) g_console_host_dir = argv[i]; i++; }
+    else if (sp_streq(a, "--console-symbols")) { extern const char *g_console_symbols; if (++i < argc) g_console_symbols = argv[i]; i++; }
     else if (sp_streq(a, "--link"))        { if (++i < argc) link_extra[n_link_extra++] = argv[i]; i++; }
     else if (sp_streq(a, "-O"))            { if (++i < argc) opt_level = argv[i]; i++; }
     /* `-O2`, the spelling every C compiler takes and the one a build script
@@ -1502,7 +1520,8 @@ int main(int argc, char **argv) {
      overflowing detectably, and always_inline bypasses the C compiler's own
      large-frame brake -- ask for the warning back (#3913). */
   int fiber_frame_guard = strstr(csrc, "/* SPINEL_FIBER_FRAME_GUARD */") != NULL;
-  int uses_crypt = strstr(csrc, "sp_str_crypt(") != NULL;  /* String#crypt: link -lcrypt */
+  /* String#crypt: link -lcrypt. A console host links the whole runtime, crypt too. */
+  int uses_crypt = console_host || strstr(csrc, "sp_str_crypt(") != NULL;
   int uses_cext, gc_none;
   const char *rt_lib = runtime_archive(csrc, uses_threads, target_wasi, exc_abort, &uses_cext, &gc_none);
   free(csrc);
@@ -1748,7 +1767,15 @@ int main(int argc, char **argv) {
     }
     free(toks);
   }
+#if defined(__APPLE__)
+  if (console_host) s_add(&cmd, "-Wl,-force_load,");
+#else
+  if (console_host) s_add(&cmd, "-rdynamic -Wl,--whole-archive ");
+#endif
   snprintf(tmp, sizeof tmp, "\"%s%c%s\" ", lib_dir, PATH_SEP, rt_lib); s_add(&cmd, tmp);
+#if !defined(__APPLE__)
+  if (console_host) s_add(&cmd, "-Wl,--no-whole-archive -ldl ");
+#endif
   { char rtp[4096]; snprintf(rtp, sizeof rtp, "%s%c%s", lib_dir, PATH_SEP, rt_lib); bi_put(&bi, "runtime", rtp); }
   /* -lm AFTER the archive: ld processes inputs left to right and (with the
      GNU default --as-needed) drops a DSO no preceding input references.
@@ -1824,9 +1851,9 @@ int main(int argc, char **argv) {
      (ld64's -dead_strip is an unknown argument to it, #4519). */
 #if defined(__APPLE__)
   if (target_wasi) s_add(&cmd, "-Wl,--gc-sections ");
-  else s_add(&cmd, "-Wl,-dead_strip ");
+  else if (!console_host) s_add(&cmd, "-Wl,-dead_strip ");
 #else
-  s_add(&cmd, "-Wl,--gc-sections ");
+  if (!console_host) s_add(&cmd, "-Wl,--gc-sections ");
 #endif
   s_add(&cmd, "-o ");
   s_add_arg(&cmd, bin_path);

@@ -1,0 +1,8 @@
+bump
+n = 1
+n = "x"
+:restart
+n + 1
+exit 3
+$count
+bump

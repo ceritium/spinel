@@ -1,0 +1,11 @@
+=> 3
+=> "ab"
+=> "ababab"
+=> {a: 1, b: 2}
+=> "a=1&b=2"
+=> [10, 20, 30]
+syntax error, line 1: unexpected ']'; expected an argument
+syntax error, line 1: unexpected ']'; expected a `)` to close the arguments
+syntax error, line 1: unexpected ']', expecting end-of-input
+syntax error, line 1: unexpected ']', ignoring it
+=> 0.25
