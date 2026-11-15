@@ -25,6 +25,7 @@ int console_host_prepare(const char *work, CSplitResult *res) { (void)work; (voi
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <prism.h>
@@ -707,6 +708,7 @@ static int run(char *const argv[], const char *log) {
     }
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, 0); close(nul); }
+    signal(SIGINT, SIG_DFL);
     execvp(argv[0], argv);
     _exit(127);
   }
@@ -855,6 +857,7 @@ static int host_start(Session *s, const char *bin) {
     setenv("SPINEL_CONSOLE_OUT", b, 1);
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, 0); close(nul); }
+    signal(SIGINT, SIG_DFL);
     execl(bin, bin, (char *)NULL);
     _exit(127);
   }
@@ -1556,6 +1559,210 @@ static void rm_rf(const char *dir) {
   run(argv, NULL);
 }
 
+/* ---- line editing on a terminal ---- */
+
+static struct termios ed_cooked;
+static int ed_raw_on;
+static char **ed_hist;
+static int ed_nhist;
+static char ed_hist_path[4096];
+
+static void ed_restore(void) {
+  if (ed_raw_on) { tcsetattr(0, TCSANOW, &ed_cooked); ed_raw_on = 0; }
+}
+
+static int ed_raw(void) {
+  if (tcgetattr(0, &ed_cooked) != 0) return -1;
+  struct termios t = ed_cooked;
+  t.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+  t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
+  t.c_cc[VMIN] = 1;
+  t.c_cc[VTIME] = 0;
+  if (tcsetattr(0, TCSANOW, &t) != 0) return -1;
+  ed_raw_on = 1;
+  return 0;
+}
+
+static void ed_hist_add(const char *l, int save) {
+  if (!*l || (ed_nhist && !strcmp(ed_hist[ed_nhist - 1], l))) return;
+  ed_hist = realloc(ed_hist, (size_t)(ed_nhist + 1) * sizeof *ed_hist);
+  ed_hist[ed_nhist++] = strdup(l);
+  if (save && ed_hist_path[0]) {
+    FILE *f = fopen(ed_hist_path, "a");
+    if (f) { fprintf(f, "%s\n", l); fclose(f); }
+  }
+}
+
+static void ed_hist_load(void) {
+  const char *home = getenv("HOME");
+  if (!home || !*home) return;
+  snprintf(ed_hist_path, sizeof ed_hist_path, "%s/.spinel_console_history", home);
+  char *t = read_file(ed_hist_path, NULL);
+  if (!t) return;
+  for (char *l = t; *l;) {
+    char *e = strchr(l, '\n');
+    if (e) *e = 0;
+    ed_hist_add(l, 0);
+    if (!e) break;
+    l = e + 1;
+  }
+  free(t);
+}
+
+static void ed_hist_free(void) {
+  for (int i = 0; i < ed_nhist; i++) free(ed_hist[i]);
+  free(ed_hist);
+  ed_hist = NULL;
+  ed_nhist = 0;
+}
+
+/* Columns between two byte offsets: one per UTF-8 character. */
+static int ed_cols(const char *s, size_t from, size_t to) {
+  int n = 0;
+  for (size_t i = from; i < to; i++) if (((unsigned char)s[i] & 0xc0) != 0x80) n++;
+  return n;
+}
+
+static void ed_refresh(const char *prompt, const Buf *b, size_t pos) {
+  Buf o = {0};
+  b_add(&o, "\r");
+  b_add(&o, prompt);
+  if (b->len) b_addn(&o, b->p, b->len);
+  b_add(&o, "\x1b[K");
+  int back = ed_cols(b->p ? b->p : "", pos, b->len);
+  if (back) b_printf(&o, "\x1b[%dD", back);
+  if (write(1, o.p, o.len) < 0) {}
+  free(o.p);
+}
+
+static void ed_set(Buf *b, size_t *pos, const char *s) {
+  b->len = 0;
+  b_add(b, s);
+  *pos = b->len;
+}
+
+static void ed_delete(Buf *b, size_t at, size_t n) {
+  memmove(b->p + at, b->p + at + n, b->len - at - n);
+  b->len -= n;
+  b->p[b->len] = 0;
+}
+
+enum { ED_LINE, ED_EOF, ED_CANCEL };
+
+/* One line typed at `prompt`, into `out` with its newline. */
+static int ed_read(const char *prompt, Buf *out) {
+  fflush(stdout);
+  if (ed_raw() != 0) {
+    fputs(prompt, stdout);
+    fflush(stdout);
+    char buf[65536];
+    if (!fgets(buf, sizeof buf, stdin)) return ED_EOF;
+    b_add(out, buf);
+    return ED_LINE;
+  }
+  Buf b = {0};
+  b_add(&b, "");
+  size_t pos = 0;
+  int hi = ed_nhist;     /* the history entry shown; ed_nhist is the edit itself */
+  char *draft = NULL;
+  int rc = ED_LINE;
+  ed_refresh(prompt, &b, pos);
+  for (;;) {
+    unsigned char c;
+    ssize_t r = read(0, &c, 1);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) { rc = ED_EOF; break; }
+    int key = c;
+    if (c == 27) {
+      unsigned char q[2];
+      if (read(0, &q[0], 1) != 1) continue;
+      if (q[0] != '[' && q[0] != 'O') continue;
+      if (read(0, &q[1], 1) != 1) continue;
+      if (q[1] >= '0' && q[1] <= '9') {
+        unsigned char t;
+        if (read(0, &t, 1) != 1 || t != '~') continue;
+        key = q[1] == '3' ? 0x104 : (q[1] == '1' || q[1] == '7') ? 1 : (q[1] == '4' || q[1] == '8') ? 5 : -1;
+      }
+      else key = q[1] == 'A' ? 16 : q[1] == 'B' ? 14 : q[1] == 'C' ? 6 : q[1] == 'D' ? 2 :
+                 q[1] == 'H' ? 1 : q[1] == 'F' ? 5 : -1;
+    }
+    switch (key) {
+    case '\r': case '\n':
+      goto done;
+    case 3:   /* ^C */
+      rc = ED_CANCEL;
+      goto done;
+    case 4:   /* ^D: end of input on an empty line */
+      if (!b.len) { rc = ED_EOF; goto done; }
+      /* fall through */
+    case 0x104:
+      if (pos < b.len) {
+        size_t n = 1;
+        while (pos + n < b.len && ((unsigned char)b.p[pos + n] & 0xc0) == 0x80) n++;
+        ed_delete(&b, pos, n);
+      }
+      break;
+    case 127: case 8:
+      if (pos) {
+        size_t s = pos - 1;
+        while (s && ((unsigned char)b.p[s] & 0xc0) == 0x80) s--;
+        ed_delete(&b, s, pos - s);
+        pos = s;
+      }
+      break;
+    case 2:   /* left */
+      if (pos) { pos--; while (pos && ((unsigned char)b.p[pos] & 0xc0) == 0x80) pos--; }
+      break;
+    case 6:   /* right */
+      if (pos < b.len) { pos++; while (pos < b.len && ((unsigned char)b.p[pos] & 0xc0) == 0x80) pos++; }
+      break;
+    case 1: pos = 0; break;
+    case 5: pos = b.len; break;
+    case 11: b.len = pos; b.p[pos] = 0; break;
+    case 21: ed_delete(&b, 0, pos); pos = 0; break;
+    case 23: {
+      size_t s = pos;
+      while (s && b.p[s - 1] == ' ') s--;
+      while (s && b.p[s - 1] != ' ') s--;
+      ed_delete(&b, s, pos - s);
+      pos = s;
+      break;
+    }
+    case 12:
+      if (write(1, "\x1b[H\x1b[2J", 7) < 0) {}
+      break;
+    case 16: case 14: {   /* history: up, down */
+      int to = key == 16 ? hi - 1 : hi + 1;
+      if (to < 0 || to > ed_nhist) break;
+      if (hi == ed_nhist) { free(draft); draft = strdup(b.p); }
+      hi = to;
+      ed_set(&b, &pos, hi == ed_nhist ? (draft ? draft : "") : ed_hist[hi]);
+      break;
+    }
+    default:
+      if (key >= 32 && key < 256 && key != 127) {
+        char ch = (char)key;
+        b_add(&b, " ");
+        memmove(b.p + pos + 1, b.p + pos, b.len - pos - 1);
+        b.p[pos++] = ch;
+      }
+      break;
+    }
+    ed_refresh(prompt, &b, pos);
+  }
+done:
+  ed_restore();
+  if (write(1, rc == ED_CANCEL ? "^C\r\n" : "\r\n", rc == ED_CANCEL ? 4 : 2) < 0) {}
+  if (rc == ED_LINE) {
+    ed_hist_add(b.p, 1);
+    b_add(out, b.p);
+    b_add(out, "\n");
+  }
+  free(draft);
+  free(b.p);
+  return rc;
+}
+
 static void usage(void) {
   fprintf(stderr,
     "Usage: spinel console [FILE.rb] [-I DIR]...\n"
@@ -1591,18 +1798,27 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
   snprintf(s.dir, sizeof s.dir, "%s/spinel-console.XXXXXX", tmp && *tmp ? tmp : "/tmp");
   if (!mkdtemp(s.dir)) { fprintf(stderr, "spinel console: %s\n", strerror(errno)); return 1; }
   signal(SIGPIPE, SIG_IGN);
+  /* ^C stops the running line (the program dies and :restart replays), not the session */
+  signal(SIGINT, SIG_IGN);
   int rc = 0;
   if (session_boot(&s, 0) != 0) {
     rc = 1;
     goto done;
   }
-  int tty = isatty(0);
+  int tty = isatty(0) && isatty(1);
+  if (tty) { ed_hist_load(); atexit(ed_restore); }
   Buf in = {0};
   char buf[65536];
   for (;;) {
-    if (tty) { fputs(in.len ? "spinel* " : "spinel> ", stdout); fflush(stdout); }
-    if (!fgets(buf, sizeof buf, stdin)) break;
-    b_add(&in, buf);
+    if (tty) {
+      int r = ed_read(in.len ? "spinel* " : "spinel> ", &in);
+      if (r == ED_EOF) break;
+      if (r == ED_CANCEL) { if (in.p) { in.len = 0; in.p[0] = 0; } continue; }
+    }
+    else {
+      if (!fgets(buf, sizeof buf, stdin)) break;
+      b_add(&in, buf);
+    }
     if (!in.len || in.p[strspn(in.p, " \t\r\n")] == 0) { in.len = 0; in.p[0] = 0; continue; }
     char cmd[64], rest[8];
     if (sscanf(in.p, " %63s %7s", cmd, rest) == 1) {
@@ -1642,6 +1858,7 @@ done:
   cset_free(&s.cur);
   smap_free(&s.locals);
   smap_free(&s.tramp);
+  ed_hist_free();
   smap_free(&s.renamed);
   free(s.cflags.p);
   free(s.prog);
