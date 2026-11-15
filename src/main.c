@@ -1520,7 +1520,8 @@ int main(int argc, char **argv) {
      overflowing detectably, and always_inline bypasses the C compiler's own
      large-frame brake -- ask for the warning back (#3913). */
   int fiber_frame_guard = strstr(csrc, "/* SPINEL_FIBER_FRAME_GUARD */") != NULL;
-  int uses_crypt = strstr(csrc, "sp_str_crypt(") != NULL;  /* String#crypt: link -lcrypt */
+  /* String#crypt: link -lcrypt. A console host links the whole runtime, crypt too. */
+  int uses_crypt = console_host || strstr(csrc, "sp_str_crypt(") != NULL;
   int uses_cext, gc_none;
   const char *rt_lib = runtime_archive(csrc, uses_threads, target_wasi, exc_abort, &uses_cext, &gc_none);
   free(csrc);

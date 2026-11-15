@@ -667,6 +667,7 @@ typedef struct {
   int nlocals;
   char *src;      /* as typed */
   int at_load;    /* its definitions run code at load */
+  int stopped;    /* ^C stopped it: a replay would not end either */
 } Line;
 
 typedef struct {
@@ -688,6 +689,7 @@ typedef struct {
   FILE *req;
   int ack;
   int timing, keep;
+  int interrupted;            /* the last host_call saw a ^C */
 } Session;
 
 static double now_s(void) {
@@ -708,7 +710,6 @@ static int run(char *const argv[], const char *log) {
     }
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, 0); close(nul); }
-    signal(SIGINT, SIG_DFL);
     execvp(argv[0], argv);
     _exit(127);
   }
@@ -785,6 +786,8 @@ static void write_session(Session *s, const Line *extra) {
       "  nil\n"
       "rescue => __spl_e\n"
       "  puts \"#{__spl_e.class}: #{__spl_e.message}\"\n"
+      "rescue Interrupt\n"
+      "  puts \"Interrupt\"\n"
       "ensure\n"
       "  $stdout.flush\n"
       "end\n",
@@ -809,12 +812,21 @@ static void write_session(Session *s, const Line *extra) {
 
 /* ---- the host process ---- */
 
+/* The host is out of the terminal's group, so a hangup does not reach it. */
+static volatile pid_t live_host;
+static void on_hup(int sig) {
+  if (live_host > 0) kill(live_host, SIGKILL);
+  _exit(128 + sig);
+}
+
 static void host_stop(Session *s) {
   if (s->req) { fclose(s->req); s->req = NULL; }
   if (s->ack >= 0) { close(s->ack); s->ack = -1; }
   if (s->host > 0) {
     int st;
-    kill(s->host, SIGTERM);
+    /* SIGKILL: a line stuck in a loop never acts on SIGTERM */
+    live_host = 0;
+    kill(s->host, SIGKILL);
     waitpid(s->host, &st, 0);
     s->host = 0;
   }
@@ -822,13 +834,22 @@ static void host_stop(Session *s) {
 
 /* One request; 1 when the host ran it, 0 when it could not load it, -1
    when the host is gone. */
+static volatile sig_atomic_t got_int;
+static void on_int(int sig) { (void)sig; got_int = 1; }
+
+
 static int host_call(Session *s, const char *path, const char *sym, int quiet) {
   if (!s->req) return -1;
   fprintf(s->req, "%s %s %s\n", path, sym, quiet ? "q" : "v");
   fflush(s->req);
   char c;
   ssize_t r;
-  while ((r = read(s->ack, &c, 1)) < 0 && errno == EINTR) {}
+  got_int = 0;
+  int ints = 0;
+  /* a second ^C kills a line that never reaches a point Interrupt is raised at */
+  while ((r = read(s->ack, &c, 1)) < 0 && errno == EINTR)
+    if (got_int) { got_int = 0; kill(s->host, ++ints > 1 ? SIGKILL : SIGINT); }
+  s->interrupted = ints > 0;
   if (r != 1) {
     int st = 0;
     if (s->host > 0) waitpid(s->host, &st, 0);
@@ -857,12 +878,14 @@ static int host_start(Session *s, const char *bin) {
     setenv("SPINEL_CONSOLE_OUT", b, 1);
     int nul = open("/dev/null", O_RDONLY);
     if (nul >= 0) { dup2(nul, 0); close(nul); }
-    signal(SIGINT, SIG_DFL);
+    /* out of the terminal's group: a ^C reaches it only while it runs a line */
+    setpgid(0, 0);
     execl(bin, bin, (char *)NULL);
     _exit(127);
   }
   close(rq[0]); close(ak[1]);
   s->host = pid;
+  live_host = pid;
   s->req = fdopen(rq[1], "w");
   s->ack = ak[0];
   /* the top level has run once the loop answers */
@@ -933,6 +956,7 @@ static int session_boot(Session *s, int show_last) {
   for (int i = 0; i < s->nlines; i++) {
     char sym[64];
     snprintf(sym, sizeof sym, "sp___spl_l%d", i + 1);
+    if (s->lines[i].stopped) continue;
     if (host_call(s, "-", sym, !(show_last && i == s->nlines - 1)) < 0) return -1;
   }
   return 0;
@@ -1550,6 +1574,7 @@ static void line_run(Session *s, Line *l) {
   char sym[64];
   snprintf(sym, sizeof sym, "sp___spl_l%d", n);
   host_call(s, so[0] ? so : "-", sym, 0);
+  s->lines[s->nlines - 1].stopped = s->interrupted;
   if (s->timing)
     fprintf(stderr, "[console] compile %.2fs, load %.2fs, run %.2fs\n", t1 - t0, t2 - t1, now_s() - t2);
 }
@@ -1798,8 +1823,14 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
   snprintf(s.dir, sizeof s.dir, "%s/spinel-console.XXXXXX", tmp && *tmp ? tmp : "/tmp");
   if (!mkdtemp(s.dir)) { fprintf(stderr, "spinel console: %s\n", strerror(errno)); return 1; }
   signal(SIGPIPE, SIG_IGN);
-  /* ^C stops the running line (the program dies and :restart replays), not the session */
-  signal(SIGINT, SIG_IGN);
+  /* ^C interrupts the running line, not the session; no SA_RESTART, so the
+     wait for the host sees it */
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = on_int;
+  sigaction(SIGINT, &sa, NULL);
+  signal(SIGHUP, on_hup);
+  signal(SIGTERM, on_hup);
   int rc = 0;
   if (session_boot(&s, 0) != 0) {
     rc = 1;
