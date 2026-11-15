@@ -122,8 +122,11 @@ the line changed:
   rebuilds the host and replays the session with its output hidden.
 
 `make console-test` runs the transcripts in `test/console/`. Known costs:
-each line takes about 0.15 s to compile, and on macOS the first `dlopen`
-of a new file takes about 0.3 s, spent outside the process.
+each line recompiles the whole session (0.15 s for a small program, 0.5 s
+at 700 lines, mostly analysis), then `cc -O0` of the changed functions.
+macOS checks each library file on its first load (about 0.3 s), so the
+console checks spare files in the background and writes each line's
+library over one.
 
 ## Proposal
 

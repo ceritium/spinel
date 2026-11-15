@@ -690,6 +690,8 @@ typedef struct {
   int ack;
   int timing, keep;
   int interrupted;            /* the last host_call saw a ^C */
+  struct { char path[4200]; pid_t pid; } pool[2];   /* see pool_fill */
+  int pool_seq;
 } Session;
 
 static double now_s(void) {
@@ -1516,7 +1518,8 @@ static int build_line_so(Session *s, const char *dir, int n, int at_load, char *
     write_file(cpath, c.p);
     free(c.p);
     Buf cmd = {0};
-    b_printf(&cmd, "%s -O1 -w -fPIC -shared", s->cc);
+    /* -O0: on a large line -O1 triples the compile, the wait each line pays */
+    b_printf(&cmd, "%s -O0 -w -fPIC -shared", s->cc);
 #if defined(__APPLE__)
     b_add(&cmd, " -undefined dynamic_lookup");
 #endif
@@ -1542,6 +1545,59 @@ static int build_line_so(Session *s, const char *dir, int n, int at_load, char *
   snprintf(s->cur_dir, sizeof s->cur_dir, "%s", dir);
   return 0;
 }
+
+#if defined(__APPLE__)
+#include <dlfcn.h>
+/* macOS checks a library file the first time any process loads it, about
+   0.3 s, and remembers the file, not its bytes. So a few files are loaded
+   once ahead of time by a child; a line's library is then written over one
+   of them and loads at once. Each file is used once: the host maps it. */
+static void pool_fill(Session *s) {
+  for (int k = 0; k < 2; k++) {
+    if (s->pool[k].path[0]) continue;
+    snprintf(s->pool[k].path, sizeof s->pool[k].path, "%s/pool%d.so", s->dir, s->pool_seq++);
+    pid_t pid = fork();
+    if (pid < 0) { s->pool[k].path[0] = 0; return; }
+    if (pid == 0) {
+      char seed[4200], c[4200], tmp[4300];
+      snprintf(seed, sizeof seed, "%s/pool_seed.so", s->dir);
+      if (access(seed, F_OK) != 0) {
+        snprintf(c, sizeof c, "%s/pool_seed.c", s->dir);
+        snprintf(tmp, sizeof tmp, "%s.%d", seed, (int)getpid());
+        write_file(c, "void sp_console_pool_seed(void) {}\n");
+        char *argv[] = { (char *)s->cc, "-shared", "-fPIC", c, "-o", tmp, NULL };
+        if (run(argv, "/dev/null") != 0 || rename(tmp, seed) != 0) _exit(1);
+      }
+      if (copy_file(seed, s->pool[k].path) != 0) _exit(1);
+      _exit(dlopen(s->pool[k].path, RTLD_NOW) ? 0 : 1);
+    }
+    s->pool[k].pid = pid;
+  }
+}
+
+/* Point `so` at a checked file holding the same library, when one is ready. */
+static void pool_take(Session *s, char *so, size_t sosz) {
+  for (int k = 0; k < 2; k++) {
+    if (!s->pool[k].path[0]) continue;
+    int st = 1;
+    while (waitpid(s->pool[k].pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && copy_file(so, s->pool[k].path) == 0)
+      snprintf(so, sosz, "%s", s->pool[k].path);
+    s->pool[k].path[0] = 0;
+    break;
+  }
+  pool_fill(s);
+}
+
+static void pool_stop(Session *s) {
+  for (int k = 0; k < 2; k++)
+    if (s->pool[k].path[0]) { kill(s->pool[k].pid, SIGKILL); waitpid(s->pool[k].pid, NULL, 0); s->pool[k].path[0] = 0; }
+}
+#else
+static void pool_fill(Session *s) { (void)s; }
+static void pool_take(Session *s, char *so, size_t sosz) { (void)s; (void)so; (void)sosz; }
+static void pool_stop(Session *s) { (void)s; }
+#endif
 
 /* Compile a line against the session and run it in the process. */
 static void line_run(Session *s, Line *l) {
@@ -1573,6 +1629,7 @@ static void line_run(Session *s, Line *l) {
   if (s->has_pend) { line_free(&s->pend); s->has_pend = 0; }
   char sym[64];
   snprintf(sym, sizeof sym, "sp___spl_l%d", n);
+  if (so[0]) pool_take(s, so, sizeof so);
   host_call(s, so[0] ? so : "-", sym, 0);
   s->lines[s->nlines - 1].stopped = s->interrupted;
   if (s->timing)
@@ -1832,6 +1889,7 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
   signal(SIGHUP, on_hup);
   signal(SIGTERM, on_hup);
   int rc = 0;
+  pool_fill(&s);
   if (session_boot(&s, 0) != 0) {
     rc = 1;
     goto done;
@@ -1881,6 +1939,7 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
   free(in.p);
 done:
   host_stop(&s);
+  pool_stop(&s);
   if (!s.keep) rm_rf(s.dir);
   else fprintf(stderr, "session kept in %s\n", s.dir);
   for (int i = 0; i < s.nlines; i++) line_free(&s.lines[i]);
