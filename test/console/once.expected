@@ -1,0 +1,11 @@
+booted
+=> 1
+=> 1
+refused: this line changes code the running program already holds:
+  local variable `n` (a value of another type)
+:restart runs every line again; it needs spinel console --replay
+=> 2
+the program exited (status 3); the next line starts a new session, without this one's lines
+booted
+=> 0
+=> 1

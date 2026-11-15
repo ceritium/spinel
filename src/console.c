@@ -689,6 +689,7 @@ typedef struct {
   FILE *req;
   int ack;
   int timing, keep;
+  int replay;                 /* --replay: a restart runs the accepted lines again */
   int interrupted;            /* the last host_call saw a ^C */
   struct { char path[4200]; pid_t pid; } pool[2];   /* see pool_fill */
   int pool_seq;
@@ -858,8 +859,10 @@ static int host_call(Session *s, const char *path, const char *sym, int quiet) {
     s->host = 0;
     fclose(s->req); s->req = NULL;
     close(s->ack); s->ack = -1;
-    if (WIFEXITED(st)) fprintf(stderr, "the program exited (status %d); :restart starts it again\n", WEXITSTATUS(st));
-    else fprintf(stderr, "the program died (signal %d); :restart starts it again\n", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    if (WIFEXITED(st)) fprintf(stderr, "the program exited (status %d)", WEXITSTATUS(st));
+    else fprintf(stderr, "the program died (signal %d)", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    fprintf(stderr, s->replay ? "; the next line starts it again and replays the session\n"
+                              : "; the next line starts a new session, without this one's lines\n");
     return -1;
   }
   return c == 'k';
@@ -919,6 +922,14 @@ static int read_cflags(Session *s, const char *log) {
   }
   free(t);
   return 0;
+}
+
+/* Drop the session's lines, so a new host runs none of them again. */
+static void session_forget(Session *s) {
+  for (int i = 0; i < s->nlines; i++) line_free(&s->lines[i]);
+  s->nlines = 0;
+  if (s->has_pend) { line_free(&s->pend); s->has_pend = 0; }
+  smap_free(&s->locals);
 }
 
 /* Build the host from the session as it stands and run its top level;
@@ -1436,7 +1447,7 @@ static int build_line_so(Session *s, const char *dir, int n, int at_load, char *
       free(why[i]);
     }
     smap_free(&said);
-    fprintf(stderr, ":restart folds the line into the program and replays the session\n");
+    if (s->replay) fprintf(stderr, ":restart folds the line into the program and replays the session\n");
     free(map); free(why); free(sel);
     smap_free(&ren);
     cset_free(&nw);
@@ -1850,8 +1861,12 @@ static void usage(void) {
     "Usage: spinel console [FILE.rb] [-I DIR]...\n"
     "Runs FILE's top level, then compiles each line against the running\n"
     "program and loads it there: its classes, objects and the line's locals\n"
-    "carry over. Commands: :restart (fold a refused line into the program and\n"
-    "replay the session), :quit (or exit, or end of input).\n");
+    "carry over. A line runs once: when the program dies, the next line\n"
+    "starts a new session.\n"
+    "  --replay  keep the session instead: a restart runs every accepted line\n"
+    "            again, side effects included, and :restart folds a refused\n"
+    "            line into the program. For development only.\n"
+    "Commands: :quit (or exit, or end of input), :restart with --replay.\n");
 }
 
 int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
@@ -1867,6 +1882,7 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
   for (int i = 0; i < argc; i++) {
     const char *a = argv[i];
     if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+    if (!strcmp(a, "--replay")) { s.replay = 1; continue; }
     if (!strcmp(a, "-I") && i + 1 < argc) { s.extra[s.nextra++] = argv[i]; s.extra[s.nextra++] = argv[++i]; continue; }
     if (!strncmp(a, "-I", 2) || !strncmp(a, "--", 2)) { s.extra[s.nextra++] = argv[i]; continue; }
     if (s.prog) { usage(); return 2; }
@@ -1913,6 +1929,11 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
     if (sscanf(in.p, " %63s %7s", cmd, rest) == 1) {
       if (!strcmp(cmd, ":quit") || !strcmp(cmd, ":q") || !strcmp(cmd, "exit") || !strcmp(cmd, "quit")) break;
       if (!strcmp(cmd, ":help")) { usage(); in.len = 0; in.p[0] = 0; continue; }
+      if (!strcmp(cmd, ":restart") && !s.replay) {
+        fprintf(stderr, ":restart runs every line again; it needs spinel console --replay\n");
+        in.len = 0; in.p[0] = 0;
+        continue;
+      }
       if (!strcmp(cmd, ":restart")) {
         int folded = s.has_pend;
         if (s.has_pend) {
@@ -1928,7 +1949,10 @@ int console_main(int argc, char **argv, const char *self, const char *lib_dir) {
         continue;
       }
     }
-    if (!s.req && session_boot(&s, 0) != 0) { in.len = 0; in.p[0] = 0; continue; }
+    if (!s.req) {
+      if (!s.replay) session_forget(&s);
+      if (session_boot(&s, 0) != 0) { in.len = 0; in.p[0] = 0; continue; }
+    }
     Line l;
     int r = line_parse(&s, in.p, &l);
     if (r == LINE_MORE) continue;

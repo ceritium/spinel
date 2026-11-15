@@ -92,7 +92,8 @@ inference (its classes, layouts and method signatures), and loaded with
 `dlopen` into the running process. New `def`s and reopened classes work
 as long as they don't change a type the program already fixed. A line
 that widens one (an Integer slot now holding nil) is refused with the slot
-named, or the session restarts with the line folded into the program.
+named, or (with `--replay`) the session restarts with the line folded
+into the program.
 
 Status: implemented as `spinel console [FILE.rb] [-I DIR]`
 (`src/console.c`), without loading a previous run's decisions. Every line
@@ -118,8 +119,13 @@ the line changed:
 - **A refusal** is any other change: a struct layout, a signature (a
   method or a local now taking another type), a non-constant global, or a
   line whose definitions run at load (a constant, a `require`). The
-  refusal names the slot. `:restart` folds the line into the program,
-  rebuilds the host and replays the session with its output hidden.
+  refusal names the slot.
+- **A line runs once.** The console is meant for live data too (fixing
+  records, starting jobs), where running a line again repeats its side
+  effects. So when the program dies, the next line starts a new session
+  without the old lines. `--replay` is for development: `:restart` folds a
+  refused line into the program, rebuilds the host and runs every accepted
+  line again with its output hidden, as does a restart after a death.
 
 `make console-test` runs the transcripts in `test/console/`. Known costs:
 each line recompiles the whole session (0.15 s for a small program, 0.5 s
