@@ -12189,6 +12189,11 @@ static int scope_ret_is_void(Compiler *c, int mi) {
 static int obj_to_json_method(Compiler *c, int cid, int *defc) {
   ClassInfo *ci = &c->classes[cid];
   if (ci->is_native_class || !ci->instantiated) return -1;
+  /* A reopened primitive (String, Integer, Float, true/false, nil, Array...)
+     boxes as a tagged value, not a v.v.p heap object: a dispatch arm for one
+     casts to a struct that doesn't exist (sp_Integer) and could never match.
+     Range/Time reopens stay: their values ARE heap objects (sp_Time). */
+  if (is_builtin_reopen(ci->name) && !is_range_or_time_class(ci->name)) return -1;
   int dc = cid;
   int mi = comp_method_in_chain(c, cid, "to_json", &dc);
   if (mi < 0) return -1;
@@ -12232,9 +12237,13 @@ static void emit_obj_to_json_dispatch(Compiler *c, Buf *b) {
     if (mi < 0) continue;
     int vobj = comp_ty_value_obj(c, ty_object(defc));
     int novalue = scope_ret_is_void(c, mi);
+    /* A reopened builtin (Time's #to_json) composes its C name with the
+       _oc stem, as mc_reopen_cls gives it; the dispatch below must ask
+       for the same symbol the direct call sites emit. */
+    const char *stem = mc_reopen_cls(c, defc, mc(c->scopes[mi].name));
     buf_printf(b, "    case %d: %s", i, novalue ? "" : "return ");
     buf_printf(b, "sp_%s_%s(%s(sp_%s *)v.v.p%s);",
-               c->classes[defc].c_name, mc(c->scopes[mi].name), vobj ? "*" : "",
+               stem, mc(c->scopes[mi].name), vobj ? "*" : "",
                c->classes[defc].c_name,
                c->scopes[mi].nparams == 1 ? ", sp_PolyArray_new()" : "");
     buf_puts(b, novalue ? " return NULL;\n" : "\n");
