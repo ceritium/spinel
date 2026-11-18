@@ -13599,6 +13599,17 @@ static int obj_to_json_method(Compiler *c, int cid, int *defc) {
   int dc = cid;
   int mi = comp_method_in_chain(c, cid, "to_json", &dc);
   if (mi < 0) return -1;
+  /* A reopened builtin cannot have an arm here: the dispatch below switches
+     on a USER class id and casts v.v.p to the defining class's struct, and a
+     builtin value is a tagged sp_RbVal whose id is the builtin's own
+     (SP_TAG_INT, SP_TAG_STR, SP_BUILTIN_TIME -- negative), never the
+     reopen's. The arm could not match, and for a primitive the cast named a
+     struct that does not exist (sp_Integer), so the C build failed; Time and
+     Range do have one (sp_Time, sp_Range), so their arms compiled but stayed
+     dead all the same. The only boxed value that carries a user class id is
+     a String subclass instance, and that is the program's own class, not a
+     reopen (sp_json_user_view gives it the id it was boxed without). */
+  if (is_builtin_reopen(c->classes[dc].name)) return -1;
   Scope *m = &c->scopes[mi];
   if (m->is_cmethod) return -1;
   if (m->ret != TY_STRING) {
